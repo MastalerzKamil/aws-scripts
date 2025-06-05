@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# CONFIGURE YOUR DOMAIN AND EMAIL HERE
+# Replace these with your actual values
 DOMAIN="domain.com"
 EMAIL="your@email.com"
 
@@ -25,7 +25,7 @@ EOF
 dnf install -y grafana
 systemctl enable --now grafana-server
 
-echo "🌐 Setting up Nginx reverse proxy for Grafana..."
+echo "🌐 Configuring Nginx reverse proxy for Grafana..."
 tee /etc/nginx/conf.d/grafana.conf > /dev/null <<EOF
 server {
     listen 80;
@@ -45,10 +45,16 @@ EOF
 systemctl enable --now nginx
 nginx -t && systemctl reload nginx
 
-echo "🔒 Issuing SSL certificate with Let's Encrypt..."
+echo "🔒 Requesting SSL certificate from Let's Encrypt..."
 certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL
 
-echo "✅ Testing renewal..."
+echo "✅ Testing renewal logic..."
 certbot renew --dry-run
 
-echo "✅ Done! Grafana is now live at: https://$DOMAIN"
+echo "📆 Setting up auto-renewal every 2 months (1st day @ 3AM)..."
+tee /etc/cron.d/certbot-bimonthly > /dev/null <<EOF
+0 3 1 */2 * root certbot renew --quiet --post-hook "systemctl reload nginx"
+EOF
+chmod 644 /etc/cron.d/certbot-bimonthly
+
+echo "🎉 Setup complete! Access your Grafana at: https://$DOMAIN"
