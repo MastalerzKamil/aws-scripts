@@ -2,7 +2,7 @@
 set -xe
 
 # --- CONFIGURATION ---
-SECRET_NAME="mydevil"
+SECRET_NAME="secret store name"
 AWS_REGION="eu-west-1"
 
 # --- SYSTEM PREP ---
