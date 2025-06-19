@@ -1,97 +1,108 @@
 #!/bin/bash
 set -e
 
-# Update and install dependencies
+# Fetch secrets from AWS Secrets Manager
+REGION="eu-west-1"
+SECRET_NAME="mydevil"
+SECRETS=$(aws secretsmanager get-secret-value --region $REGION --secret-id $SECRET_NAME --query SecretString --output text)
+
+# Parse secrets into variables
+export N8N_DOMAIN=$(echo $SECRETS | jq -r '.N8N_DOMAIN')
+export CERT_EMAIL=$(echo $SECRETS | jq -r '.CERT_EMAIL')
+export PG_USERNAME=$(echo $SECRETS | jq -r '.PG_USERNAME')
+export PG_PASSWORD=$(echo $SECRETS | jq -r '.PG_PASSWORD')
+export PG_HOST=$(echo $SECRETS | jq -r '.PG_HOST')
+export PG_PORT=$(echo $SECRETS | jq -r '.PG_PORT')
+export PG_DATABASE=$(echo $SECRETS | jq -r '.PG_DATABASE')
+export N8N_USERNAME=$(echo $SECRETS | jq -r '.N8N_USERNAME')
+export N8N_PASSWORD=$(echo $SECRETS | jq -r '.N8N_PASSWORD')
+
+# Install dependencies
 dnf update -y
-dnf install -y docker jq aws-cli nginx python3-certbot-nginx git
+dnf install -y docker git nginx jq curl
 
-# Enable and start services
+# Start and enable Docker
 systemctl enable --now docker
-systemctl enable --now nginx
 
-# Add ec2-user to Docker group
-usermod -aG docker ec2-user
+# Install Docker Compose
+curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
 
-export SECRECT_MANAGER_REGION="aws region"
-export SECRET_NAME="secret store name"
-
-# Fetch secrets
-SECRET_JSON=$(aws secretsmanager get-secret-value --region $SECRET_MANAGER_REGION --secret-id $SECRET_NAME --query SecretString --output text)
-
-# Parse PostgreSQL config
-export PG_HOST=$(echo "$SECRET_JSON" | jq -r .PG_HOST)
-export PG_PORT=$(echo "$SECRET_JSON" | jq -r .PG_PORT)
-export PG_DATABASE=$(echo "$SECRET_JSON" | jq -r .PG_DBNAME)
-export PG_USER=$(echo "$SECRET_JSON" | jq -r .PG_USERNAME)
-export PG_PASSWORD=$(echo "$SECRET_JSON" | jq -r .PG_PASSWORD)
-
-# Parse n8n & SSL config
-export N8N_USERNAME=$(echo "$SECRET_JSON" | jq -r .N8N_USERNAME)
-export N8N_PASSWORD=$(echo "$SECRET_JSON" | jq -r .N8N_PASSWORD)
-export N8N_DOMAIN=$(echo "$SECRET_JSON" | jq -r .N8N_DOMAIN)
-export CERT_EMAIL=$(echo "$SECRET_JSON" | jq -r .CERT_EMAIL)
-
-# Build ARM-compatible n8n image
+# Create n8n Docker Compose config
 mkdir -p /opt/n8n && cd /opt/n8n
-cat > Dockerfile <<'EOF'
-FROM node:18-alpine
-RUN apk add --no-cache python3 make g++ curl bash
-RUN npm install -g n8n
-CMD ["n8n"]
+
+cat <<EOF > docker-compose.yml
+version: '3.8'
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: always
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=${PG_HOST}
+      - DB_POSTGRESDB_PORT=${PG_PORT}
+      - DB_POSTGRESDB_DATABASE=${PG_DATABASE}
+      - DB_POSTGRESDB_USER=${PG_USERNAME}
+      - DB_POSTGRESDB_PASSWORD=${PG_PASSWORD}
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USERNAME}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD}
+      - N8N_HOST=${N8N_DOMAIN}
+      - N8N_PORT=5678
+      - WEBHOOK_URL=https://${N8N_DOMAIN}/
+      - N8N_EDITOR_BASE_URL=https://${N8N_DOMAIN}/
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
 EOF
 
-docker build -t custom-n8n-arm .
+docker-compose up -d
 
-# Run n8n container
-docker run -d \
-  --name n8n \
-  -p 127.0.0.1:5678:5678 \
-  -v n8n_data:/home/node/.n8n \
-  --restart always \
-  -e DB_TYPE=postgresdb \
-  -e DB_POSTGRESDB_HOST=$PG_HOST \
-  -e DB_POSTGRESDB_PORT=$PG_PORT \
-  -e DB_POSTGRESDB_DATABASE=$PG_DATABASE \
-  -e DB_POSTGRESDB_USER=$PG_USER \
-  -e DB_POSTGRESDB_PASSWORD=$PG_PASSWORD \
-  -e N8N_BASIC_AUTH_ACTIVE=true \
-  -e N8N_BASIC_AUTH_USER=$N8N_USERNAME \
-  -e N8N_BASIC_AUTH_PASSWORD=$N8N_PASSWORD \
-  -e N8N_HOST=$N8N_DOMAIN \
-  -e WEBHOOK_TUNNEL_URL=https://$N8N_DOMAIN \
-  -e GENERIC_TIMEZONE=Europe/Warsaw \
-  -e N8N_RUNNERS_ENABLED=true \
-  custom-n8n-arm
+# Install Certbot
+dnf install -y epel-release
+dnf install -y certbot python3-certbot-nginx
 
-# Create NGINX reverse proxy config
-cat > /etc/nginx/conf.d/n8n.conf <<EOF
+# Generate SSL cert
+certbot --nginx --non-interactive --agree-tos --email ${CERT_EMAIL} -d ${N8N_DOMAIN}
+
+# Nginx config
+cat <<EOF > /etc/nginx/conf.d/n8n.conf
 server {
     listen 80;
-    server_name $N8N_DOMAIN;
+    server_name ${N8N_DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name ${N8N_DOMAIN};
+
+    ssl_certificate /etc/letsencrypt/live/${N8N_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${N8N_DOMAIN}/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
     location / {
         proxy_pass http://127.0.0.1:5678;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
     }
 }
 EOF
 
-# Reload nginx
+# Reload Nginx
+systemctl enable --now nginx
 nginx -t && systemctl reload nginx
 
-# Request SSL certificate
-certbot --nginx --non-interactive --agree-tos --redirect --email $CERT_EMAIL -d $N8N_DOMAIN
-
-# Cron: renew SSL every 60 days (2nd month only)
-cat > /etc/cron.monthly/certbot-renew-n8n <<'EOF'
-#!/bin/bash
-# Run only if current month is even (Feb, Apr, Jun...)
-if [ $((10#$(date +%m) % 2)) -eq 0 ]; then
-  /usr/bin/certbot renew --quiet --post-hook "docker restart n8n && systemctl reload nginx"
-fi
-EOF
-
-chmod +x /etc/cron.monthly/certbot-renew-n8n
+# Setup SSL auto-renew
+echo "0 3 * * * root certbot renew --post-hook 'systemctl reload nginx'" > /etc/cron.d/certbot-renew
